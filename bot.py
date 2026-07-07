@@ -18,6 +18,7 @@ from aiogram.types import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from anthropic import Anthropic
+from aiohttp import web
 
 logging.basicConfig(level=logging.INFO)
 
@@ -165,7 +166,7 @@ def format_list(rows) -> str:
     return "\n".join(lines)
 
 
-def ask_claude_ingredients(dish: str, portions: int) -> list[str]:
+def ask_claude_ingredients_sync(dish: str, portions: int) -> list[str]:
     prompt = (
         f"Дай список продуктов для блюда «{dish}» на {portions} порций(и). "
         "Ответь ТОЛЬКОJSON-массивом строк вида \"Название — количество\", "
@@ -184,15 +185,27 @@ def ask_claude_ingredients(dish: str, portions: int) -> list[str]:
         return [line.strip("-• ") for line in text.splitlines() if line.strip()]
 
 
+async def ask_claude_ingredients(dish: str, portions: int) -> list[str]:
+    return await asyncio.to_thread(ask_claude_ingredients_sync, dish, portions)
+
+
 async def transcribe_voice(file_path: str) -> str | None:
     if not OPENAI_API_KEY:
         return None
     from openai import OpenAI
 
     client = OpenAI(api_key=OPENAI_API_KEY)
-    with open(file_path, "rb") as f:
-        result = client.audio.transcriptions.create(model="whisper-1", file=f)
-    return result.text
+    try:
+        with open(file_path, "rb") as f:
+            result = client.audio.transcriptions.create(model="whisper-1", file=f)
+        return result.text
+    except Exception:
+        return None
+    finally:
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
 
 
 # ---------- Handlers ----------
@@ -230,9 +243,21 @@ async def got_portions(message: Message, state: FSMContext):
     except ValueError:
         await message.answer("Пришли просто число, например 4")
         return
-    dish = pending_dish.pop(message.from_user.id, "блюдо")
+    dish = pending_dish.pop(message.from_user.id, "")
+    if not dish.strip():
+        await state.clear()
+        await message.answer("Название блюда пустое, начни заново.", reply_markup=MAIN_KB)
+        return
     await message.answer("Считаю...")
-    ingredients = ask_claude_ingredients(dish, portions)
+    try:
+        ingredients = await ask_claude_ingredients(dish, portions)
+    except Exception:
+        await state.clear()
+        await message.answer(
+            "Не получилось спросить Claude — сбой API или закончился баланс. Попробуй ещё раз чуть позже.",
+            reply_markup=MAIN_KB,
+        )
+        return
     add_items(message.from_user.id, ingredients)
     await state.clear()
     await message.answer(
@@ -256,9 +281,10 @@ async def manual_voice(message: Message, state: FSMContext):
     local_path = f"/tmp/{message.voice.file_id}.oga"
     await bot.download_file(file.file_path, local_path)
     text = await transcribe_voice(local_path)
-    os.remove(local_path)
     if not text:
-        await message.answer("Голосовые пока не настроены (нет OPENAI_API_KEY). Напиши текстом.")
+        await message.answer(
+            "Не получилось распознать голосовое (нет ключа или сбой сервиса). Напиши текстом."
+        )
         return
     names = [n.strip() for n in text.split(",")]
     add_items(message.from_user.id, names)
@@ -315,17 +341,20 @@ async def got_reminder_time(message: Message, state: FSMContext):
     await state.clear()
     if text in ("выкл", "off", "отключить"):
         remove_reminder(message.from_user.id)
+        unschedule_reminder(message.from_user.id)
         await message.answer("Напоминание отключено.", reply_markup=MAIN_KB)
         return
     try:
         hour, minute = map(int, text.split(":"))
-        assert 0 <= hour < 24 and 0 <= minute < 60
-    except Exception:
+    except ValueError:
         await message.answer("Не понял время. Формат ЧЧ:ММ, например 18:00")
+        return
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        await message.answer("Часы 0-23, минуты 0-59. Формат ЧЧ:ММ, например 18:00")
         return
     set_reminder(message.from_user.id, hour, minute)
     schedule_reminder(message.from_user.id, hour, minute)
-    await message.answer(f"Готово, буду напоминать в {hour:02d}:{minute:02d}.", reply_markup=MAIN_KB)
+    await message.answer(f"Готово, буду напоминать в {hour:02d}:{minute:02d} (время сервера, UTC).", reply_markup=MAIN_KB)
 
 
 # ---------- Scheduler ----------
@@ -344,6 +373,12 @@ def schedule_reminder(user_id: int, hour: int, minute: int):
     )
 
 
+def unschedule_reminder(user_id: int):
+    job_id = f"reminder_{user_id}"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+
+
 async def send_reminder(user_id: int):
     rows = get_items(user_id)
     if not rows:
@@ -356,12 +391,29 @@ def load_reminders():
         schedule_reminder(r["user_id"], r["hour"], r["minute"])
 
 
+# ---------- Фиктивный HTTP-сервер (для Render Web Service + UptimeRobot) ----------
+
+async def health(request):
+    return web.Response(text="ok")
+
+
+async def start_http_server():
+    port = int(os.environ.get("PORT", 10000))
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+
 # ---------- Entrypoint ----------
 
 async def main():
     init_db()
     load_reminders()
     scheduler.start()
+    await start_http_server()
     await dp.start_polling(bot)
 
 
