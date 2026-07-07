@@ -3,7 +3,6 @@ import logging
 import os
 import sqlite3
 import json
-from datetime import datetime, time
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, StateFilter
@@ -12,9 +11,12 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message,
+    CallbackQuery,
     ReplyKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from anthropic import Anthropic
@@ -24,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # опционально, для голосовых
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # опционально, для голосовых (сейчас не используется)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -66,20 +68,24 @@ def init_db():
     conn.close()
 
 
-def add_items(user_id: int, names: list[str]):
+def add_items(user_id: int, names: list[str]) -> list[str]:
+    cleaned = [n.strip() for n in names if n.strip()]
+    if not cleaned:
+        return []
     conn = db()
     conn.executemany(
         "INSERT INTO items (user_id, name) VALUES (?, ?)",
-        [(user_id, n.strip()) for n in names if n.strip()],
+        [(user_id, n) for n in cleaned],
     )
     conn.commit()
     conn.close()
+    return cleaned
 
 
 def get_items(user_id: int):
     conn = db()
     rows = conn.execute(
-        "SELECT id, name, checked FROM items WHERE user_id=? ORDER BY id", (user_id,)
+        "SELECT id, name, checked FROM items WHERE user_id=? ORDER BY checked, id", (user_id,)
     ).fetchall()
     conn.close()
     return rows
@@ -102,6 +108,13 @@ def toggle_item(user_id: int, item_id: int):
             "UPDATE items SET checked=? WHERE id=?", (0 if row["checked"] else 1, item_id)
         )
         conn.commit()
+    conn.close()
+
+
+def delete_item(user_id: int, item_id: int):
+    conn = db()
+    conn.execute("DELETE FROM items WHERE id=? AND user_id=?", (item_id, user_id))
+    conn.commit()
     conn.close()
 
 
@@ -141,6 +154,40 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+CANCEL_KB = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text="🚫 Отмена", callback_data="cancel")]]
+)
+
+ADD_MORE_MANUAL_KB = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить ещё", callback_data="more_manual")],
+        [InlineKeyboardButton(text="✅ Готово", callback_data="done_adding")],
+    ]
+)
+
+ADD_MORE_DISH_KB = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Ещё блюдо", callback_data="more_dish")],
+        [InlineKeyboardButton(text="✅ Готово", callback_data="done_adding")],
+    ]
+)
+
+
+def list_keyboard(rows) -> InlineKeyboardMarkup:
+    buttons = []
+    for r in rows:
+        mark = "✅" if r["checked"] else "▫️"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{mark} {r['name']}", callback_data=f"toggle:{r['id']}"
+                ),
+                InlineKeyboardButton(text="🗑", callback_data=f"delitem:{r['id']}"),
+            ]
+        )
+    buttons.append([InlineKeyboardButton(text="➕ Добавить", callback_data="more_manual")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 # ---------- States ----------
 
@@ -162,14 +209,14 @@ def format_list(rows) -> str:
     lines = []
     for r in rows:
         mark = "✅" if r["checked"] else "▫️"
-        lines.append(f"{mark} {r['name']} (#{r['id']})")
+        lines.append(f"{mark} {r['name']}")
     return "\n".join(lines)
 
 
 def ask_claude_ingredients_sync(dish: str, portions: int) -> list[str]:
     prompt = (
         f"Дай список продуктов для блюда «{dish}» на {portions} порций(и). "
-        "Ответь ТОЛЬКОJSON-массивом строк вида \"Название — количество\", "
+        "Ответь ТОЛЬКО JSON-массивом строк вида \"Название — количество\", "
         "без markdown и пояснений. Пример: [\"Мука — 200 г\", \"Яйца — 2 шт\"]"
     )
     resp = claude.messages.create(
@@ -189,26 +236,7 @@ async def ask_claude_ingredients(dish: str, portions: int) -> list[str]:
     return await asyncio.to_thread(ask_claude_ingredients_sync, dish, portions)
 
 
-async def transcribe_voice(file_path: str) -> str | None:
-    if not OPENAI_API_KEY:
-        return None
-    from openai import OpenAI
-
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    try:
-        with open(file_path, "rb") as f:
-            result = client.audio.transcriptions.create(model="whisper-1", file=f)
-        return result.text
-    except Exception:
-        return None
-    finally:
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
-
-
-# ---------- Handlers ----------
+# ---------- Handlers: старт / отмена ----------
 
 @router.message(Command("start"))
 async def start(message: Message, state: FSMContext):
@@ -216,32 +244,83 @@ async def start(message: Message, state: FSMContext):
     await message.answer(
         "Привет! Я собираю список покупок.\n\n"
         "🍽 По блюду — назови блюдо, накидаю ингредиенты\n"
-        "✍️ Вручную — впиши продукты сам (через запятую или голосом)\n"
-        "📋 Список — показать текущий список\n"
-        "⏰ Напоминание — во сколько присылать список каждый день",
+        "✍️ Вручную — впиши продукты сам (через запятую)\n"
+        "📋 Список — показать текущий список с кнопками\n"
+        "⏰ Напоминание — во сколько присылать список каждый день\n\n"
+        "В любой момент можно написать /cancel, чтобы выйти из текущего действия.",
         reply_markup=MAIN_KB,
     )
 
 
+@router.message(Command("cancel"))
+async def cancel_cmd(message: Message, state: FSMContext):
+    await state.clear()
+    pending_dish.pop(message.from_user.id, None)
+    await message.answer("Отменено.", reply_markup=MAIN_KB)
+
+
+@router.callback_query(F.data == "cancel")
+async def cancel_callback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    pending_dish.pop(callback.from_user.id, None)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Отменено.", reply_markup=MAIN_KB)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "done_adding")
+async def done_adding(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    pending_dish.pop(callback.from_user.id, None)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.answer("Ок, что дальше?", reply_markup=MAIN_KB)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "more_dish")
+async def more_dish(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(States.waiting_dish)
+    await callback.message.answer("Какое блюдо?", reply_markup=CANCEL_KB)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "more_manual")
+async def more_manual(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(States.waiting_manual)
+    await callback.message.answer(
+        "Пиши продукты через запятую, одним сообщением.", reply_markup=CANCEL_KB
+    )
+    await callback.answer()
+
+
+# ---------- Handlers: по блюду ----------
+
 @router.message(F.text == "🍽 По блюду")
 async def ask_dish(message: Message, state: FSMContext):
     await state.set_state(States.waiting_dish)
-    await message.answer("Какое блюдо?", reply_markup=ReplyKeyboardRemove())
+    await message.answer("Какое блюдо?", reply_markup=CANCEL_KB)
 
 
 @router.message(StateFilter(States.waiting_dish))
 async def got_dish(message: Message, state: FSMContext):
-    pending_dish[message.from_user.id] = message.text
+    if not message.text or not message.text.strip():
+        await message.answer("Напиши название блюда текстом.")
+        return
+    pending_dish[message.from_user.id] = message.text.strip()
     await state.set_state(States.waiting_portions)
-    await message.answer("На сколько порций? (число)")
+    await message.answer("На сколько порций? (число)", reply_markup=CANCEL_KB)
 
 
 @router.message(StateFilter(States.waiting_portions))
 async def got_portions(message: Message, state: FSMContext):
     try:
         portions = int(message.text.strip())
-    except ValueError:
-        await message.answer("Пришли просто число, например 4")
+        if portions <= 0:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await message.answer("Пришли просто число больше нуля, например 4")
         return
     dish = pending_dish.pop(message.from_user.id, "")
     if not dish.strip():
@@ -258,65 +337,79 @@ async def got_portions(message: Message, state: FSMContext):
             reply_markup=MAIN_KB,
         )
         return
-    add_items(message.from_user.id, ingredients)
+    added = add_items(message.from_user.id, ingredients)
     await state.clear()
+    if not added:
+        await message.answer("Claude не вернул ни одного продукта, попробуй переформулировать блюдо.", reply_markup=MAIN_KB)
+        return
     await message.answer(
-        f"Добавил в список для «{dish}»:\n\n" + "\n".join(f"• {i}" for i in ingredients),
-        reply_markup=MAIN_KB,
+        f"Добавил в список для «{dish}»:\n\n" + "\n".join(f"• {i}" for i in added),
+        reply_markup=ADD_MORE_DISH_KB,
     )
 
+
+# ---------- Handlers: вручную ----------
 
 @router.message(F.text == "✍️ Вручную")
 async def ask_manual(message: Message, state: FSMContext):
     await state.set_state(States.waiting_manual)
     await message.answer(
-        "Пиши продукты через запятую, одним сообщением или голосом.",
-        reply_markup=ReplyKeyboardRemove(),
+        "Пиши продукты через запятую, одним сообщением.",
+        reply_markup=CANCEL_KB,
     )
 
 
 @router.message(StateFilter(States.waiting_manual), F.voice)
 async def manual_voice(message: Message, state: FSMContext):
-    file = await bot.get_file(message.voice.file_id)
-    local_path = f"/tmp/{message.voice.file_id}.oga"
-    await bot.download_file(file.file_path, local_path)
-    text = await transcribe_voice(local_path)
-    if not text:
-        await message.answer(
-            "Не получилось распознать голосовое (нет ключа или сбой сервиса). Напиши текстом."
-        )
-        return
-    names = [n.strip() for n in text.split(",")]
-    add_items(message.from_user.id, names)
-    await state.clear()
-    await message.answer(f"Добавил: {', '.join(names)}", reply_markup=MAIN_KB)
+    await message.answer("Голосовые пока отключены. Напиши продукты текстом через запятую.")
 
 
 @router.message(StateFilter(States.waiting_manual))
 async def manual_text(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Пришли текстом, через запятую.")
+        return
     names = [n.strip() for n in message.text.split(",")]
-    add_items(message.from_user.id, names)
+    added = add_items(message.from_user.id, names)
     await state.clear()
-    await message.answer(f"Добавил: {', '.join(names)}", reply_markup=MAIN_KB)
+    if not added:
+        await message.answer("Пусто, ничего не добавил.", reply_markup=MAIN_KB)
+        return
+    await message.answer(
+        f"Добавил: {', '.join(added)}",
+        reply_markup=ADD_MORE_MANUAL_KB,
+    )
 
+
+# ---------- Handlers: список ----------
 
 @router.message(F.text == "📋 Список")
 async def show_list(message: Message):
     rows = get_items(message.from_user.id)
-    await message.answer(format_list(rows))
-    if rows:
-        await message.answer("Отметить купленное: /done ID (например /done 3)")
-
-
-@router.message(Command("done"))
-async def mark_done(message: Message):
-    parts = message.text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Формат: /done ID")
+    if not rows:
+        await message.answer("Список пуст.", reply_markup=list_keyboard(rows))
         return
-    toggle_item(message.from_user.id, int(parts[1]))
-    rows = get_items(message.from_user.id)
-    await message.answer(format_list(rows))
+    await message.answer(format_list(rows), reply_markup=list_keyboard(rows))
+
+
+@router.callback_query(F.data.startswith("toggle:"))
+async def toggle_callback(callback: CallbackQuery):
+    item_id = int(callback.data.split(":")[1])
+    toggle_item(callback.from_user.id, item_id)
+    rows = get_items(callback.from_user.id)
+    text = format_list(rows) if rows else "Список пуст."
+    await callback.message.edit_text(text, reply_markup=list_keyboard(rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("delitem:"))
+async def delete_callback(callback: CallbackQuery):
+    item_id = int(callback.data.split(":")[1])
+    delete_item(callback.from_user.id, item_id)
+    rows = get_items(callback.from_user.id)
+    text = format_list(rows) if rows else "Список пуст."
+    await callback.message.edit_text(text, reply_markup=list_keyboard(rows))
+    await callback.answer("Удалено")
 
 
 @router.message(F.text == "🗑 Очистить")
@@ -325,19 +418,21 @@ async def clear_list(message: Message):
     await message.answer("Список очищен.", reply_markup=MAIN_KB)
 
 
+# ---------- Handlers: напоминание ----------
+
 @router.message(F.text == "⏰ Напоминание")
 async def ask_reminder(message: Message, state: FSMContext):
     await state.set_state(States.waiting_reminder_time)
     await message.answer(
         "Во сколько присылать список каждый день? Формат ЧЧ:ММ (например 18:00). "
         "Пришли \"выкл\", чтобы отключить.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=CANCEL_KB,
     )
 
 
 @router.message(StateFilter(States.waiting_reminder_time))
 async def got_reminder_time(message: Message, state: FSMContext):
-    text = message.text.strip().lower()
+    text = (message.text or "").strip().lower()
     await state.clear()
     if text in ("выкл", "off", "отключить"):
         remove_reminder(message.from_user.id)
@@ -347,14 +442,24 @@ async def got_reminder_time(message: Message, state: FSMContext):
     try:
         hour, minute = map(int, text.split(":"))
     except ValueError:
-        await message.answer("Не понял время. Формат ЧЧ:ММ, например 18:00")
+        await message.answer("Не понял время. Формат ЧЧ:ММ, например 18:00", reply_markup=MAIN_KB)
         return
     if not (0 <= hour < 24 and 0 <= minute < 60):
-        await message.answer("Часы 0-23, минуты 0-59. Формат ЧЧ:ММ, например 18:00")
+        await message.answer("Часы 0-23, минуты 0-59. Формат ЧЧ:ММ, например 18:00", reply_markup=MAIN_KB)
         return
     set_reminder(message.from_user.id, hour, minute)
     schedule_reminder(message.from_user.id, hour, minute)
-    await message.answer(f"Готово, буду напоминать в {hour:02d}:{minute:02d} (время сервера, UTC).", reply_markup=MAIN_KB)
+    await message.answer(
+        f"Готово, буду напоминать в {hour:02d}:{minute:02d} (время сервера, UTC).",
+        reply_markup=MAIN_KB,
+    )
+
+
+# ---------- Фоллбэк: сообщение вне известных состояний ----------
+
+@router.message()
+async def fallback(message: Message, state: FSMContext):
+    await message.answer("Не понял. Выбери действие в меню.", reply_markup=MAIN_KB)
 
 
 # ---------- Scheduler ----------
