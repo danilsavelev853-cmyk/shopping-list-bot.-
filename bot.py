@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import json
 
@@ -236,6 +237,34 @@ async def ask_claude_ingredients(dish: str, portions: int) -> list[str]:
     return await asyncio.to_thread(ask_claude_ingredients_sync, dish, portions)
 
 
+def parse_command_sync(text: str) -> dict:
+    prompt = (
+        f"Команда для бота-списка покупок (обращение уже убрано): \"{text}\"\n"
+        "Определи действие и товары. Ответь ТОЛЬКО JSON без markdown, строго в формате:\n"
+        '{"action": "add"|"remove"|"show"|"clear"|"unknown", "items": ["товар1", "товар2"]}\n'
+        "add — добавить товары в список, items — список названий.\n"
+        "remove — убрать товары из списка, items — список названий (как их могли назвать).\n"
+        "show — просто показать список, items пустой.\n"
+        "clear — полностью очистить список, items пустой.\n"
+        "unknown — если не про список покупок вообще."
+    )
+    resp = claude.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    text_out = resp.content[0].text.strip()
+    text_out = text_out.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        return json.loads(text_out)
+    except json.JSONDecodeError:
+        return {"action": "unknown", "items": []}
+
+
+async def parse_command(text: str) -> dict:
+    return await asyncio.to_thread(parse_command_sync, text)
+
+
 # ---------- Handlers: старт / отмена ----------
 
 @router.message(Command("start"))
@@ -293,6 +322,68 @@ async def more_manual(callback: CallbackQuery, state: FSMContext):
         "Пиши продукты через запятую, одним сообщением.", reply_markup=CANCEL_KB
     )
     await callback.answer()
+
+
+WAKE_WORD_RE = re.compile(r"(?i)^марк[,:]?\s*(.*)$")
+
+
+@router.message(F.text.regexp(WAKE_WORD_RE))
+async def wake_word_handler(message: Message, state: FSMContext):
+    match = WAKE_WORD_RE.match(message.text)
+    rest = (match.group(1) or "").strip()
+    if not rest:
+        await message.answer("Слушаю. Что сделать со списком?")
+        return
+
+    await state.clear()
+    pending_dish.pop(message.from_user.id, None)
+
+    try:
+        result = await parse_command(rest)
+    except Exception:
+        await message.answer(
+            "Не получилось разобрать команду — сбой Claude. Попробуй ещё раз.",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    action = result.get("action")
+    items = result.get("items") or []
+
+    if action == "add":
+        added = add_items(message.from_user.id, items)
+        if added:
+            await message.answer(f"Добавил: {', '.join(added)}", reply_markup=MAIN_KB)
+        else:
+            await message.answer("Не понял, что добавить.", reply_markup=MAIN_KB)
+
+    elif action == "remove":
+        rows = get_items(message.from_user.id)
+        removed = []
+        for name in items:
+            for r in rows:
+                if name.lower() in r["name"].lower() or r["name"].lower() in name.lower():
+                    delete_item(message.from_user.id, r["id"])
+                    removed.append(r["name"])
+        if removed:
+            await message.answer(f"Удалил: {', '.join(removed)}", reply_markup=MAIN_KB)
+        else:
+            await message.answer("Не нашёл такого в списке.", reply_markup=MAIN_KB)
+
+    elif action == "show":
+        rows = get_items(message.from_user.id)
+        text = format_list(rows) if rows else "Список пуст."
+        await message.answer(text, reply_markup=list_keyboard(rows))
+
+    elif action == "clear":
+        clear_items(message.from_user.id)
+        await message.answer("Список очищен.", reply_markup=MAIN_KB)
+
+    else:
+        await message.answer(
+            "Не понял команду. Попробуй, например: «Марк добавь молоко» или «Марк удали хлеб».",
+            reply_markup=MAIN_KB,
+        )
 
 
 # ---------- Handlers: по блюду ----------
