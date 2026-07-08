@@ -220,11 +220,16 @@ def ask_claude_ingredients_sync(dish: str, portions: int) -> list[str]:
         "Ответь ТОЛЬКО JSON-массивом строк вида \"Название — количество\", "
         "без markdown и пояснений. Пример: [\"Мука — 200 г\", \"Яйца — 2 шт\"]"
     )
-    resp = claude.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    resp = None
+    try:
+        resp = claude.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as e:
+        logging.error("Anthropic API error in ask_claude_ingredients_sync: %s", repr(e))
+        raise
     text = resp.content[0].text.strip()
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     try:
@@ -248,11 +253,15 @@ def parse_command_sync(text: str) -> dict:
         "clear — полностью очистить список, items пустой.\n"
         "unknown — если не про список покупок вообще."
     )
-    resp = claude.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    try:
+        resp = claude.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as e:
+        logging.error("Anthropic API error in parse_command_sync: %s", repr(e))
+        raise
     text_out = resp.content[0].text.strip()
     text_out = text_out.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
     try:
